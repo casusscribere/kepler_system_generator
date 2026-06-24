@@ -102,11 +102,20 @@
       <label for="trails">Show trails</label>
       <input id="trails" type="checkbox" checked />
     </div>
+    <div class="row">
+      <label for="predict">Predict path</label>
+      <input id="predict" type="checkbox" checked />
+    </div>
     <div class="btnrow">
       <button id="pause">Pause</button>
       <button id="fit">Fit view</button>
+      <button id="clear">Clear shots</button>
     </div>
-    <div class="hint">Scroll to zoom · drag to pan · seed lives in the URL</div>
+    <div class="hint">
+      <b>Drag on empty space</b> &amp; release to slingshot a projectile —
+      gravity bends its path through the system.<br />
+      Shift-drag or right-drag to pan · scroll to zoom · seed lives in the URL
+    </div>
   </div>
   <script src="sketch.js"></script>
 </body>

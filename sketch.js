@@ -11,6 +11,25 @@
 
 const TWO_PI = Math.PI * 2;
 
+// ---- gravity / physics constants -----------------------------------------
+// The orbit periods use  T = PERIOD_COEF * (a / A_REF)^1.5  (Kepler's 3rd law).
+// For a central force  T = 2π * a^1.5 / sqrt(GM), so the star's gravitational
+// parameter that REPRODUCES those same orbits is fixed (independent of the
+// star's drawn radius). Using it for launched projectiles means a projectile
+// feels exactly the gravity field the planets themselves orbit in.
+const A_REF = 70;
+const PERIOD_COEF = 4.0;
+const STAR_MU = Math.pow((TWO_PI * Math.pow(A_REF, 1.5)) / PERIOD_COEF, 2);
+// Planet mass ∝ radius^3 (volume); a radius-8 world is ~5% of the star's pull,
+// so flybys perturb a projectile noticeably and gas giants give real assists.
+const PLANET_MU_FRAC = 0.05;
+const PLANET_MU_REF_R = 8;
+
+// Slingshot launch tuning.
+const LAUNCH_K = 1.0;   // launch speed per world-unit of pull-back
+const VMAX = 720;       // speed cap
+const ESCAPE_R = 7000;  // projectiles beyond this are gone
+
 // ---- seeded PRNG ---------------------------------------------------------
 // xmur3 hashes a string to a 32-bit seed; mulberry32 turns that into a fast,
 // well-distributed stream of floats in [0, 1). Deterministic per seed.
@@ -106,6 +125,7 @@ function generateSystem(seed) {
     cls: st.cls,
     radius: rng.range(st.minR, st.maxR),
     color: st.color,
+    mu: STAR_MU, // gravitational parameter (fixed so it matches the orbits)
   };
 
   const bodies = [];
@@ -127,7 +147,7 @@ function generateSystem(seed) {
     if (rng.chance(0.12)) e = rng.range(0.35, 0.6);
 
     // Kepler's 3rd law: T ∝ a^(3/2). Scaled so inner orbits take a few seconds.
-    const period = 4.0 * Math.pow(a / 70, 1.5) * rng.range(0.9, 1.1);
+    const period = PERIOD_COEF * Math.pow(a / A_REF, 1.5) * rng.range(0.9, 1.1);
 
     const radius = rng.range(pc.rMin, pc.rMax);
     const planet = {
@@ -140,6 +160,8 @@ function generateSystem(seed) {
       M0: rng.range(0, TWO_PI),
       radius,
       color: jitterColor(rng, rng.pick(pc.palette)),
+      // gravitational parameter for launched projectiles (mass ∝ radius^3)
+      mu: STAR_MU * PLANET_MU_FRAC * Math.pow(radius / PLANET_MU_REF_R, 3),
       moons: [],
     };
 
@@ -203,10 +225,21 @@ let dragging = false, lastX = 0, lastY = 0;
 let stars = [];   // background starfield
 let trails = [];  // per-body recent positions
 
+// Slingshot launcher state.
+let projectiles = [];      // { x, y, vx, vy, trail[], alive, fade }
+let impacts = [];          // expanding impact rings
+let aiming = false;        // currently dragging out a launch
+let aimAnchor = { x: 0, y: 0 }; // launch origin (world coords)
+let aimCurr = { x: 0, y: 0 };   // current pull point (world coords)
+let panMode = false;       // the active drag is panning, not aiming
+let showPredict = true;     // draw the predicted trajectory while aiming
+
 // -------------------------------------------------------------------------
 
 function setup() {
-  createCanvas(windowWidth, windowHeight);
+  const cnv = createCanvas(windowWidth, windowHeight);
+  // Right-drag pans, so stop the browser context menu on the canvas.
+  cnv.elt.addEventListener('contextmenu', (e) => e.preventDefault());
   seedStarfield();
   // Seed priority: URL hash (shareable link) > a fresh random seed.
   const fromHash = decodeURIComponent((window.location.hash || '').replace(/^#/, '')).trim();
@@ -228,6 +261,9 @@ function loadSystem(newSeed, autoFit = true) {
 
   t = 0; panX = 0; panY = 0;
   resetTrails();
+  projectiles = [];
+  impacts = [];
+  aiming = false;
 
   if (autoFit) fitView();
   else fitView();
@@ -306,7 +342,10 @@ function orbitalPosition(o, time) {
 function draw() {
   background(5, 6, 13);
 
-  if (!paused) t += (deltaTime / 1000) * speed;
+  const dt = paused ? 0 : (deltaTime / 1000) * speed;
+  t += dt;
+  updateProjectiles(dt);
+  updateImpacts(dt);
 
   push();
   translate(width / 2 + panX, height / 2 + panY);
@@ -332,6 +371,10 @@ function draw() {
       }
     }
   }
+
+  drawProjectiles();
+  drawImpacts();
+  drawAiming();
 
   pop();
 }
@@ -398,7 +441,224 @@ function drawBody(p, body) {
   circle(p.x, p.y, body.radius * 2);
 }
 
+// ---- gravity & projectiles ----------------------------------------------
+
+// Gravity sources (star + planets) at a given simulation time. Moons and
+// comets are too light to matter and are skipped.
+function gravitySources(time) {
+  const src = [{ x: 0, y: 0, mu: system.star.mu, radius: system.star.radius }];
+  for (const b of system.bodies) {
+    if (b.comet || !b.mu) continue;
+    const p = orbitalPosition(b, time);
+    src.push({ x: p.x, y: p.y, mu: b.mu, radius: b.radius });
+  }
+  return src;
+}
+
+// Net gravitational acceleration at (x, y) from all sources. Plummer-softened
+// near each body so close passes stay finite rather than blowing up.
+function accelAt(x, y, sources) {
+  let ax = 0, ay = 0;
+  for (const s of sources) {
+    const dx = s.x - x, dy = s.y - y;
+    const soft = s.radius * 0.5;
+    const r2 = dx * dx + dy * dy + soft * soft;
+    const inv = s.mu / (r2 * Math.sqrt(r2)); // mu / r^3
+    ax += dx * inv;
+    ay += dy * inv;
+  }
+  return [ax, ay];
+}
+
+// One velocity-Verlet step for a projectile against a fixed source snapshot.
+function stepProjectile(pr, h, sources) {
+  const a0 = accelAt(pr.x, pr.y, sources);
+  pr.x += pr.vx * h + 0.5 * a0[0] * h * h;
+  pr.y += pr.vy * h + 0.5 * a0[1] * h * h;
+  const a1 = accelAt(pr.x, pr.y, sources);
+  pr.vx += 0.5 * (a0[0] + a1[0]) * h;
+  pr.vy += 0.5 * (a0[1] + a1[1]) * h;
+
+  for (const s of sources) {
+    const dx = pr.x - s.x, dy = pr.y - s.y;
+    if (dx * dx + dy * dy < s.radius * s.radius) {
+      pr.alive = false;
+      spawnImpact(pr.x, pr.y, s.radius);
+      return;
+    }
+  }
+  if (pr.x * pr.x + pr.y * pr.y > ESCAPE_R * ESCAPE_R) pr.alive = false;
+}
+
+// Advance every projectile over this frame's dt. Bodies move during the frame,
+// so we resample the gravity field on each fixed sub-step (shared across all
+// projectiles for that sub-step — cost is independent of projectile count).
+function updateProjectiles(dt) {
+  if (dt > 0 && projectiles.some((p) => p.alive)) {
+    const target = 0.015;
+    const steps = Math.min(200, Math.max(1, Math.ceil(dt / target)));
+    const h = dt / steps;
+    for (let i = 0; i < steps; i++) {
+      const time = t - dt + h * (i + 1);
+      const sources = gravitySources(time);
+      for (const pr of projectiles) {
+        if (pr.alive) stepProjectile(pr, h, sources);
+      }
+    }
+    for (const pr of projectiles) {
+      if (pr.alive) {
+        pr.trail.push({ x: pr.x, y: pr.y });
+        if (pr.trail.length > 260) pr.trail.shift();
+      }
+    }
+  }
+  // Fade out spent projectiles, then drop them.
+  for (const pr of projectiles) {
+    if (!pr.alive) pr.fade -= dt > 0 ? dt * 1.1 : 0;
+  }
+  projectiles = projectiles.filter((pr) => pr.alive || pr.fade > 0);
+}
+
+// Initial velocity from the current slingshot pull (launch is opposite the
+// drag direction, magnitude proportional to pull length).
+function launchVelocity() {
+  const dx = aimAnchor.x - aimCurr.x;
+  const dy = aimAnchor.y - aimCurr.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 3) return null;
+  const v = Math.min(len * LAUNCH_K, VMAX);
+  return { vx: (dx / len) * v, vy: (dy / len) * v, len, speed: v };
+}
+
+function launchProjectile() {
+  const v = launchVelocity();
+  if (!v) return;
+  projectiles.push({
+    x: aimAnchor.x, y: aimAnchor.y, vx: v.vx, vy: v.vy, trail: [], alive: true, fade: 1,
+  });
+  if (projectiles.length > 60) projectiles.shift();
+}
+
+// Integrate a throwaway copy forward to preview the path. Bodies are frozen at
+// the current time, so it's a close (not exact) guide for moving targets.
+function predictedPath() {
+  const v = launchVelocity();
+  if (!v) return null;
+  const sources = gravitySources(t);
+  let x = aimAnchor.x, y = aimAnchor.y, vx = v.vx, vy = v.vy;
+  const pts = [{ x, y }];
+  const h = 0.04;
+  for (let i = 0; i < 600; i++) {
+    const a0 = accelAt(x, y, sources);
+    x += vx * h + 0.5 * a0[0] * h * h;
+    y += vy * h + 0.5 * a0[1] * h * h;
+    const a1 = accelAt(x, y, sources);
+    vx += 0.5 * (a0[0] + a1[0]) * h;
+    vy += 0.5 * (a0[1] + a1[1]) * h;
+    pts.push({ x, y });
+    let hit = false;
+    for (const s of sources) {
+      const dx = x - s.x, dy = y - s.y;
+      if (dx * dx + dy * dy < s.radius * s.radius) { hit = true; break; }
+    }
+    if (hit || x * x + y * y > ESCAPE_R * ESCAPE_R) break;
+  }
+  return pts;
+}
+
+function spawnImpact(x, y, r) {
+  impacts.push({ x, y, r: r * 0.5, max: r * 3.5, life: 1 });
+}
+
+function updateImpacts(dt) {
+  for (const f of impacts) {
+    f.r += (f.max - f.r) * Math.min(1, (dt > 0 ? dt : 0.016) * 5);
+    f.life -= (dt > 0 ? dt : 0.016) * 1.6;
+  }
+  impacts = impacts.filter((f) => f.life > 0);
+}
+
+function drawProjectiles() {
+  for (const pr of projectiles) {
+    const tr = pr.trail;
+    const fade = pr.alive ? 1 : Math.max(0, pr.fade);
+    noFill();
+    strokeWeight(2 / zoom);
+    for (let k = 1; k < tr.length; k++) {
+      const a = map(k, 0, tr.length, 0, 220) * fade;
+      stroke(150, 230, 255, a);
+      line(tr[k - 1].x, tr[k - 1].y, tr[k].x, tr[k].y);
+    }
+    if (pr.alive) {
+      noStroke();
+      fill(150, 230, 255, 70);
+      circle(pr.x, pr.y, 9);
+      fill(235, 250, 255);
+      circle(pr.x, pr.y, 3.6);
+    }
+  }
+}
+
+function drawImpacts() {
+  noFill();
+  for (const f of impacts) {
+    stroke(255, 200, 120, 220 * Math.max(0, f.life));
+    strokeWeight(2 / zoom);
+    circle(f.x, f.y, f.r * 2);
+  }
+}
+
+function drawAiming() {
+  if (!aiming) return;
+  const v = launchVelocity();
+
+  // The pull-back band (faint, from origin to the current pointer).
+  stroke(140, 160, 230, 120);
+  strokeWeight(1.5 / zoom);
+  line(aimAnchor.x, aimAnchor.y, aimCurr.x, aimCurr.y);
+
+  if (showPredict && v) {
+    const pts = predictedPath();
+    if (pts) {
+      noFill();
+      stroke(150, 230, 255, 150);
+      strokeWeight(1.5 / zoom);
+      // dashed look: draw every other short segment
+      for (let k = 1; k < pts.length; k++) {
+        if (k % 2 === 0) continue;
+        line(pts[k - 1].x, pts[k - 1].y, pts[k].x, pts[k].y);
+      }
+    }
+    // Launch-direction arrowhead.
+    const ux = v.vx / v.speed, uy = v.vy / v.speed;
+    const tipLen = 16 + Math.min(40, v.speed * 0.06);
+    const tx = aimAnchor.x + ux * tipLen, ty = aimAnchor.y + uy * tipLen;
+    stroke(150, 230, 255, 220);
+    strokeWeight(2 / zoom);
+    line(aimAnchor.x, aimAnchor.y, tx, ty);
+    const ax = -uy, ay = ux;
+    line(tx, ty, tx - ux * 7 + ax * 4, ty - uy * 7 + ay * 4);
+    line(tx, ty, tx - ux * 7 - ax * 4, ty - uy * 7 - ay * 4);
+  }
+
+  // The launch origin.
+  noStroke();
+  fill(235, 250, 255);
+  circle(aimAnchor.x, aimAnchor.y, 5 / zoom);
+}
+
 // ---- interaction ---------------------------------------------------------
+
+function screenToWorld(sx, sy) {
+  return { x: (sx - (width / 2 + panX)) / zoom, y: (sy - (height / 2 + panY)) / zoom };
+}
+
+function isOverUI(mx, my) {
+  const el = document.getElementById('ui');
+  if (!el) return false;
+  const r = el.getBoundingClientRect();
+  return mx >= r.left && mx <= r.right && my >= r.top && my <= r.bottom;
+}
 
 function mouseWheel(e) {
   const factor = e.delta > 0 ? 0.92 : 1.08;
@@ -407,21 +667,42 @@ function mouseWheel(e) {
 }
 
 function mousePressed() {
-  if (mouseX < 290 && mouseY < 300) return; // ignore clicks over the UI panel
-  dragging = true;
-  lastX = mouseX;
-  lastY = mouseY;
+  if (isOverUI(mouseX, mouseY)) return; // let the panel handle its own clicks
+
+  // Right-button or Shift pans the view; a plain left drag aims the slingshot.
+  if (mouseButton === RIGHT || keyIsDown(SHIFT)) {
+    dragging = true;
+    panMode = true;
+    lastX = mouseX;
+    lastY = mouseY;
+    return;
+  }
+
+  aiming = true;
+  panMode = false;
+  aimAnchor = screenToWorld(mouseX, mouseY);
+  aimCurr = { ...aimAnchor };
 }
 
 function mouseDragged() {
-  if (!dragging) return;
-  panX += mouseX - lastX;
-  panY += mouseY - lastY;
-  lastX = mouseX;
-  lastY = mouseY;
+  if (dragging && panMode) {
+    panX += mouseX - lastX;
+    panY += mouseY - lastY;
+    lastX = mouseX;
+    lastY = mouseY;
+    return;
+  }
+  if (aiming) aimCurr = screenToWorld(mouseX, mouseY);
 }
 
-function mouseReleased() { dragging = false; }
+function mouseReleased() {
+  if (aiming) {
+    launchProjectile();
+    aiming = false;
+  }
+  dragging = false;
+  panMode = false;
+}
 
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
@@ -456,6 +737,9 @@ function wireUI() {
     btn.textContent = 'Copied!';
     setTimeout(() => { btn.textContent = old; }, 1100);
   });
+
+  $('predict').addEventListener('change', (e) => { showPredict = e.target.checked; });
+  $('clear').addEventListener('click', () => { projectiles = []; impacts = []; });
 
   $('pause').addEventListener('click', (e) => {
     paused = !paused;
