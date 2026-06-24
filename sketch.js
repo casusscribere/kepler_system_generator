@@ -210,11 +210,11 @@ function setup() {
   seedStarfield();
   // Seed priority: URL hash (shareable link) > a fresh random seed.
   const fromHash = decodeURIComponent((window.location.hash || '').replace(/^#/, '')).trim();
-  loadSystem(fromHash || randomSeed(), false);
+  loadSystem(fromHash || freshSeed(), false);
   wireUI();
 }
 
-function randomSeed() {
+function freshSeed() {
   // Short, readable, copy-pasteable. Browser Math.random is fine here.
   let s = '';
   for (let i = 0; i < 7; i++) s += Math.floor(Math.random() * 36).toString(36);
@@ -223,7 +223,7 @@ function randomSeed() {
 
 // Generate (or regenerate) the system for a seed and reset the view to fit it.
 function loadSystem(newSeed, autoFit = true) {
-  seed = newSeed || randomSeed();
+  seed = newSeed || freshSeed();
   system = generateSystem(seed);
 
   t = 0; panX = 0; panY = 0;
@@ -438,10 +438,10 @@ function wireUI() {
     if (!showTrails) resetTrails();
   });
 
-  $('random').addEventListener('click', () => loadSystem(randomSeed()));
-  $('load').addEventListener('click', () => loadSystem($('seed').value.trim() || randomSeed()));
+  $('random').addEventListener('click', () => loadSystem(freshSeed()));
+  $('load').addEventListener('click', () => loadSystem($('seed').value.trim() || freshSeed()));
   $('seed').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') loadSystem($('seed').value.trim() || randomSeed());
+    if (e.key === 'Enter') loadSystem($('seed').value.trim() || freshSeed());
   });
 
   $('copy').addEventListener('click', async () => {
