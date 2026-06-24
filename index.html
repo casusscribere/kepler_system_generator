@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Solar System — Elliptical &amp; Eccentric Orbits</title>
+  <title>Procedural Solar System — Seeded Generation</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
   <style>
     html, body {
@@ -46,6 +46,22 @@
     #ui label { opacity: 0.85; }
     #ui input[type="range"] { width: 110px; accent-color: #7c8cff; }
     #ui .hint { opacity: 0.55; font-size: 11px; margin-top: 8px; }
+    #ui .info { opacity: 0.7; font-size: 11px; margin: 2px 0 10px; min-height: 14px; }
+    #ui .sep { height: 1px; background: rgba(120, 140, 220, 0.2); margin: 10px 0; }
+    #ui .seedrow { display: flex; gap: 6px; margin-bottom: 6px; }
+    #ui input[type="text"] {
+      flex: 1;
+      min-width: 0;
+      background: rgba(8, 10, 24, 0.8);
+      color: #eef1ff;
+      border: 1px solid rgba(124, 140, 255, 0.4);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 12px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      letter-spacing: 0.5px;
+    }
+    #ui .btnrow { display: flex; gap: 6px; flex-wrap: wrap; }
     #ui button {
       background: rgba(124, 140, 255, 0.18);
       color: #cfd6ff;
@@ -54,13 +70,26 @@
       padding: 4px 10px;
       cursor: pointer;
       font-size: 12px;
+      flex: 1;
     }
     #ui button:hover { background: rgba(124, 140, 255, 0.32); }
+    #ui button.primary { background: rgba(124, 140, 255, 0.32); }
   </style>
 </head>
 <body>
   <div id="ui">
-    <h1>☉ Solar System</h1>
+    <h1>☉ Procedural System</h1>
+    <label style="font-size:11px;opacity:0.7;">Seed (copy / share / load)</label>
+    <div class="seedrow">
+      <input id="seed" type="text" spellcheck="false" autocomplete="off" />
+      <button id="copy" style="flex:0 0 auto;">Copy</button>
+    </div>
+    <div class="btnrow">
+      <button id="random" class="primary">⟲ Random</button>
+      <button id="load">Load seed</button>
+    </div>
+    <div id="info" class="info"></div>
+    <div class="sep"></div>
     <div class="row">
       <label for="speed">Speed</label>
       <input id="speed" type="range" min="0" max="5" step="0.05" value="1" />
@@ -73,11 +102,11 @@
       <label for="trails">Show trails</label>
       <input id="trails" type="checkbox" checked />
     </div>
-    <div class="row">
+    <div class="btnrow">
       <button id="pause">Pause</button>
-      <button id="reset">Reset</button>
+      <button id="fit">Fit view</button>
     </div>
-    <div class="hint">Scroll to zoom · drag to pan</div>
+    <div class="hint">Scroll to zoom · drag to pan · seed lives in the URL</div>
   </div>
   <script src="sketch.js"></script>
 </body>

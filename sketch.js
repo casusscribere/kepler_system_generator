@@ -1,41 +1,196 @@
 /*
- * Solar System — elliptical & eccentric orbits
+ * Procedural Solar System — seeded generation + elliptical/eccentric orbits
  *
- * Each body follows a true Keplerian ellipse rather than a circle.
- * The central star sits at one focus of every ellipse (Kepler's 1st law),
- * and bodies sweep equal areas in equal time (Kepler's 2nd law), so they
- * visibly speed up at periapsis and slow down at apoapsis.
- *
- * Position is found each frame by:
- *   1. advancing the mean anomaly  M = M0 + n*t
- *   2. solving Kepler's equation    M = E - e*sin(E)   for the eccentric anomaly E
- *   3. converting E -> true anomaly and radius on the ellipse
- *   4. rotating the ellipse by its argument of periapsis (orbit tilt)
+ * A whole star system is derived deterministically from a short seed string.
+ * The same seed always reproduces the same system, so a seed can be copied,
+ * shared (it also lives in the URL hash), and re-loaded later. Orbits are true
+ * Keplerian ellipses with the star at one focus; bodies obey Kepler's equation
+ * (speed up at periapsis, slow at apoapsis) and Kepler's 3rd law (period grows
+ * with semi-major axis).
  */
-
-// ---- tunable scene -------------------------------------------------------
-
-const STAR = { radius: 26, color: [255, 214, 110] };
-
-// a  : semi-major axis (px)         e   : eccentricity (0 = circle, ->1 = needle)
-// period : orbital period (seconds at speed 1)
-// peri   : argument of periapsis (radians) — rotates the ellipse in its plane
-// M0     : starting mean anomaly (radians) — spreads bodies out at t = 0
-const BODIES = [
-  { name: 'Mercury', a: 70,  e: 0.45, period: 5,  peri: 0.4,  M0: 0.0, radius: 4,  color: [180, 170, 160] },
-  { name: 'Venus',   a: 110, e: 0.12, period: 9,  peri: 2.1,  M0: 1.7, radius: 7,  color: [222, 184, 120] },
-  { name: 'Earth',   a: 160, e: 0.20, period: 14, peri: 5.0,  M0: 3.2, radius: 8,  color: [110, 160, 255],
-    moons: [ { a: 22, e: 0.05, period: 1.6, peri: 0, M0: 0, radius: 3, color: [200, 200, 210] } ] },
-  { name: 'Mars',    a: 220, e: 0.55, period: 22, peri: 1.2,  M0: 0.6, radius: 6,  color: [235, 110, 70] },
-  { name: 'Comet',   a: 320, e: 0.82, period: 40, peri: 3.6,  M0: 5.5, radius: 3,  color: [180, 230, 255], comet: true },
-  { name: 'Jupiter', a: 400, e: 0.10, period: 55, peri: 0.9,  M0: 2.4, radius: 18, color: [210, 170, 130] },
-];
 
 const TWO_PI = Math.PI * 2;
 
+// ---- seeded PRNG ---------------------------------------------------------
+// xmur3 hashes a string to a 32-bit seed; mulberry32 turns that into a fast,
+// well-distributed stream of floats in [0, 1). Deterministic per seed.
+
+function xmur3(str) {
+  let h = 1779033703 ^ str.length;
+  for (let i = 0; i < str.length; i++) {
+    h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+    h = (h << 13) | (h >>> 19);
+  }
+  return function () {
+    h = Math.imul(h ^ (h >>> 16), 2246822507);
+    h = Math.imul(h ^ (h >>> 13), 3266489909);
+    h ^= h >>> 16;
+    return h >>> 0;
+  };
+}
+
+function mulberry32(a) {
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Convenience wrapper around a seeded stream.
+function makeRng(seed) {
+  const next = mulberry32(xmur3(seed)());
+  const api = {
+    next,
+    range: (lo, hi) => lo + next() * (hi - lo),
+    int: (lo, hi) => Math.floor(lo + next() * (hi - lo + 1)),
+    chance: (p) => next() < p,
+    pick: (arr) => arr[Math.floor(next() * arr.length)],
+    // approx. normal via two samples; handy for clustering values near a mean
+    gauss: () => (next() + next() + next() - 1.5) / 1.5,
+  };
+  return api;
+}
+
+// ---- generation tables ---------------------------------------------------
+
+// Main-sequence spectral classes, weighted by real-ish abundance (M common,
+// O rare). Drives the star's colour and size.
+const STAR_TYPES = [
+  { cls: 'M', color: [255, 150, 90],  minR: 16, maxR: 22, weight: 46 },
+  { cls: 'K', color: [255, 190, 120], minR: 18, maxR: 24, weight: 24 },
+  { cls: 'G', color: [255, 225, 150], minR: 20, maxR: 26, weight: 14 },
+  { cls: 'F', color: [255, 245, 220], minR: 22, maxR: 28, weight: 8  },
+  { cls: 'A', color: [210, 225, 255], minR: 24, maxR: 32, weight: 5  },
+  { cls: 'B', color: [170, 200, 255], minR: 28, maxR: 38, weight: 2  },
+  { cls: 'O', color: [150, 180, 255], minR: 32, maxR: 44, weight: 1  },
+];
+
+const PLANET_CLASSES = {
+  rocky:  { rMin: 3,  rMax: 8,  palette: [[180,170,160],[200,160,120],[160,140,130],[210,120,90]] },
+  desert: { rMin: 5,  rMax: 9,  palette: [[220,180,120],[230,150,90],[200,170,110]] },
+  ocean:  { rMin: 6,  rMax: 10, palette: [[90,140,230],[70,170,200],[110,160,255]] },
+  ice:    { rMin: 4,  rMax: 9,  palette: [[200,225,240],[180,210,235],[210,230,255]] },
+  gas:    { rMin: 12, rMax: 22, palette: [[210,170,130],[200,180,150],[180,160,200],[170,190,210]] },
+};
+
+function weightedStar(rng) {
+  const total = STAR_TYPES.reduce((s, t) => s + t.weight, 0);
+  let r = rng.next() * total;
+  for (const t of STAR_TYPES) {
+    if ((r -= t.weight) <= 0) return t;
+  }
+  return STAR_TYPES[0];
+}
+
+function jitterColor(rng, c) {
+  return [
+    constrain(c[0] + rng.int(-18, 18), 0, 255),
+    constrain(c[1] + rng.int(-18, 18), 0, 255),
+    constrain(c[2] + rng.int(-18, 18), 0, 255),
+  ];
+}
+
+// ---- the generator -------------------------------------------------------
+// Builds { star, bodies } from a seed. Inner planets skew rocky/desert, outer
+// skew gas/ice. Spacing is geometric (Titius–Bode-like). Period comes from
+// Kepler's 3rd law so the whole system stays physically coherent.
+
+function generateSystem(seed) {
+  const rng = makeRng(seed);
+
+  const st = weightedStar(rng);
+  const star = {
+    cls: st.cls,
+    radius: rng.range(st.minR, st.maxR),
+    color: st.color,
+  };
+
+  const bodies = [];
+  const numPlanets = rng.int(3, 8);
+  let a = rng.range(64, 92); // first orbit's semi-major axis
+
+  for (let i = 0; i < numPlanets; i++) {
+    const frac = numPlanets > 1 ? i / (numPlanets - 1) : 0; // 0 inner -> 1 outer
+
+    // Pick a class biased by distance from the star.
+    let type;
+    if (frac < 0.33) type = rng.pick(['rocky', 'rocky', 'desert', 'ocean']);
+    else if (frac < 0.66) type = rng.pick(['rocky', 'desert', 'ocean', 'ice', 'gas']);
+    else type = rng.pick(['gas', 'gas', 'ice', 'ice']);
+    const pc = PLANET_CLASSES[type];
+
+    // Eccentricity: usually gentle, with an occasional eccentric standout.
+    let e = Math.min(0.6, Math.abs(rng.gauss()) * 0.14);
+    if (rng.chance(0.12)) e = rng.range(0.35, 0.6);
+
+    // Kepler's 3rd law: T ∝ a^(3/2). Scaled so inner orbits take a few seconds.
+    const period = 4.0 * Math.pow(a / 70, 1.5) * rng.range(0.9, 1.1);
+
+    const radius = rng.range(pc.rMin, pc.rMax);
+    const planet = {
+      name: `${star.cls}-${i + 1}`,
+      type,
+      a,
+      e,
+      period,
+      peri: rng.range(0, TWO_PI),
+      M0: rng.range(0, TWO_PI),
+      radius,
+      color: jitterColor(rng, rng.pick(pc.palette)),
+      moons: [],
+    };
+
+    // Bigger / outer worlds get moons.
+    const maxMoons = type === 'gas' ? 4 : type === 'ocean' || type === 'ice' ? 2 : 1;
+    const numMoons = rng.chance(radius > 9 ? 0.85 : 0.35) ? rng.int(1, maxMoons) : 0;
+    let ma = radius + rng.range(6, 12);
+    for (let m = 0; m < numMoons; m++) {
+      planet.moons.push({
+        a: ma,
+        e: rng.range(0, 0.12),
+        period: rng.range(1.2, 3.5),
+        peri: rng.range(0, TWO_PI),
+        M0: rng.range(0, TWO_PI),
+        radius: rng.range(1.5, Math.max(2, radius * 0.28)),
+        color: jitterColor(rng, [200, 200, 210]),
+      });
+      ma += rng.range(6, 12);
+    }
+
+    bodies.push(planet);
+    a *= rng.range(1.38, 1.72); // geometric spacing to the next orbit
+  }
+
+  // 0–2 comets on long, highly eccentric orbits.
+  const numComets = rng.chance(0.6) ? rng.int(1, 2) : 0;
+  for (let c = 0; c < numComets; c++) {
+    bodies.push({
+      name: `comet-${c + 1}`,
+      type: 'comet',
+      comet: true,
+      a: a * rng.range(0.7, 1.2),
+      e: rng.range(0.6, 0.9),
+      period: 28 * rng.range(0.8, 1.6),
+      peri: rng.range(0, TWO_PI),
+      M0: rng.range(0, TWO_PI),
+      radius: rng.range(2.5, 3.5),
+      color: jitterColor(rng, [180, 230, 255]),
+      moons: [],
+    });
+  }
+
+  return { star, bodies };
+}
+
 // ---- runtime state -------------------------------------------------------
 
-let t = 0;              // simulation time (seconds)
+let seed = '';
+let system = null;
+
+let t = 0;
 let speed = 1;
 let paused = false;
 let showOrbits = true;
@@ -45,16 +200,60 @@ let zoom = 1;
 let panX = 0, panY = 0;
 let dragging = false, lastX = 0, lastY = 0;
 
-let stars = [];        // background starfield
-let trails = [];       // per-body recent positions
+let stars = [];   // background starfield
+let trails = [];  // per-body recent positions
 
 // -------------------------------------------------------------------------
 
 function setup() {
   createCanvas(windowWidth, windowHeight);
   seedStarfield();
-  resetTrails();
+  // Seed priority: URL hash (shareable link) > a fresh random seed.
+  const fromHash = decodeURIComponent((window.location.hash || '').replace(/^#/, '')).trim();
+  loadSystem(fromHash || randomSeed(), false);
   wireUI();
+}
+
+function randomSeed() {
+  // Short, readable, copy-pasteable. Browser Math.random is fine here.
+  let s = '';
+  for (let i = 0; i < 7; i++) s += Math.floor(Math.random() * 36).toString(36);
+  return s.toUpperCase();
+}
+
+// Generate (or regenerate) the system for a seed and reset the view to fit it.
+function loadSystem(newSeed, autoFit = true) {
+  seed = newSeed || randomSeed();
+  system = generateSystem(seed);
+
+  t = 0; panX = 0; panY = 0;
+  resetTrails();
+
+  if (autoFit) fitView();
+  else fitView();
+
+  // Reflect the seed everywhere the user might read or copy it.
+  const input = document.getElementById('seed');
+  if (input) input.value = seed;
+  const info = document.getElementById('info');
+  if (info) {
+    const planets = system.bodies.filter((b) => !b.comet).length;
+    const comets = system.bodies.filter((b) => b.comet).length;
+    info.textContent =
+      `${system.star.cls}-class star · ${planets} planet${planets === 1 ? '' : 's'}` +
+      (comets ? ` · ${comets} comet${comets === 1 ? '' : 's'}` : '');
+  }
+  if (window.history && window.history.replaceState) {
+    window.history.replaceState(null, '', '#' + encodeURIComponent(seed));
+  }
+}
+
+// Zoom so the outermost apoapsis comfortably fits on screen.
+function fitView() {
+  let maxR = system.star.radius;
+  for (const b of system.bodies) maxR = Math.max(maxR, b.a * (1 + b.e));
+  const margin = 0.46 * Math.min(width, height);
+  zoom = constrain(margin / maxR, 0.2, 4);
 }
 
 function seedStarfield() {
@@ -71,13 +270,15 @@ function seedStarfield() {
 }
 
 function resetTrails() {
-  trails = BODIES.map(() => []);
+  trails = system ? system.bodies.map(() => []) : [];
 }
+
+// ---- orbital mechanics ---------------------------------------------------
 
 // Solve Kepler's equation  M = E - e*sin(E)  for E via Newton-Raphson.
 function solveKepler(M, e) {
   M = ((M % TWO_PI) + TWO_PI) % TWO_PI;
-  let E = e < 0.8 ? M : Math.PI; // good initial guess
+  let E = e < 0.8 ? M : Math.PI;
   for (let i = 0; i < 8; i++) {
     const dE = (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
     E -= dE;
@@ -86,21 +287,21 @@ function solveKepler(M, e) {
   return E;
 }
 
-// Returns the {x, y} of a body on its ellipse, with the focus at (0,0).
+// {x, y} of a body on its ellipse, with the focus (the star) at (0,0).
 function orbitalPosition(o, time) {
-  const n = TWO_PI / o.period;        // mean motion (rad/s)
-  const M = o.M0 + n * time;          // mean anomaly
-  const E = solveKepler(M, o.e);      // eccentric anomaly
+  const n = TWO_PI / o.period;
+  const M = o.M0 + n * time;
+  const E = solveKepler(M, o.e);
 
-  // Position in the orbital frame: focus at origin, periapsis along +x.
   const b = o.a * Math.sqrt(1 - o.e * o.e);
   const px = o.a * (Math.cos(E) - o.e);
   const py = b * Math.sin(E);
 
-  // Rotate by argument of periapsis to tilt the ellipse.
   const c = Math.cos(o.peri), s = Math.sin(o.peri);
   return { x: px * c - py * s, y: px * s + py * c };
 }
+
+// ---- render loop ---------------------------------------------------------
 
 function draw() {
   background(5, 6, 13);
@@ -114,8 +315,8 @@ function draw() {
   drawStarfield();
   drawStar();
 
-  for (let i = 0; i < BODIES.length; i++) {
-    const body = BODIES[i];
+  for (let i = 0; i < system.bodies.length; i++) {
+    const body = system.bodies[i];
     if (showOrbits) drawOrbitPath(body);
 
     const p = orbitalPosition(body, t);
@@ -123,7 +324,6 @@ function draw() {
     if (showTrails) updateAndDrawTrail(i, p, body);
     drawBody(p, body);
 
-    // Moons orbit their parent body.
     if (body.moons) {
       for (const moon of body.moons) {
         const mp = orbitalPosition(moon, t);
@@ -146,31 +346,30 @@ function drawStarfield() {
 }
 
 function drawStar() {
+  const col = system.star.color;
+  const R = system.star.radius;
   noStroke();
-  // glow
-  for (let r = STAR.radius * 4; r > STAR.radius; r -= 4) {
-    const a = map(r, STAR.radius, STAR.radius * 4, 60, 0);
-    fill(STAR.color[0], STAR.color[1], STAR.color[2], a);
+  for (let r = R * 4; r > R; r -= 4) {
+    const a = map(r, R, R * 4, 60, 0);
+    fill(col[0], col[1], col[2], a);
     circle(0, 0, r * 2);
   }
-  fill(STAR.color[0], STAR.color[1], STAR.color[2]);
-  circle(0, 0, STAR.radius * 2);
+  fill(col[0], col[1], col[2]);
+  circle(0, 0, R * 2);
 }
 
-// Draw the full ellipse the body travels along. `center` lets moon orbits
-// be drawn around their parent instead of the star.
 function drawOrbitPath(o, center) {
   const cx = center ? center.x : 0;
   const cy = center ? center.y : 0;
   noFill();
   stroke(120, 140, 220, center ? 50 : 70);
   strokeWeight(1 / zoom);
+  const b = o.a * Math.sqrt(1 - o.e * o.e);
+  const c = Math.cos(o.peri), s = Math.sin(o.peri);
   beginShape();
   for (let E = 0; E <= TWO_PI + 0.05; E += 0.05) {
-    const b = o.a * Math.sqrt(1 - o.e * o.e);
     const px = o.a * (Math.cos(E) - o.e);
     const py = b * Math.sin(E);
-    const c = Math.cos(o.peri), s = Math.sin(o.peri);
     vertex(cx + px * c - py * s, cy + px * s + py * c);
   }
   endShape();
@@ -193,7 +392,6 @@ function updateAndDrawTrail(i, p, body) {
 
 function drawBody(p, body) {
   noStroke();
-  // soft halo
   fill(body.color[0], body.color[1], body.color[2], 50);
   circle(p.x, p.y, body.radius * 3);
   fill(body.color[0], body.color[1], body.color[2]);
@@ -204,12 +402,12 @@ function drawBody(p, body) {
 
 function mouseWheel(e) {
   const factor = e.delta > 0 ? 0.92 : 1.08;
-  zoom = constrain(zoom * factor, 0.25, 6);
-  return false; // block page scroll
+  zoom = constrain(zoom * factor, 0.1, 8);
+  return false;
 }
 
 function mousePressed() {
-  if (mouseX < 270 && mouseY < 220) return; // don't grab over the UI panel
+  if (mouseX < 290 && mouseY < 300) return; // ignore clicks over the UI panel
   dragging = true;
   lastX = mouseX;
   lastY = mouseY;
@@ -232,18 +430,36 @@ function windowResized() {
 
 function wireUI() {
   const $ = (id) => document.getElementById(id);
+
   $('speed').addEventListener('input', (e) => { speed = parseFloat(e.target.value); });
   $('orbits').addEventListener('change', (e) => { showOrbits = e.target.checked; });
   $('trails').addEventListener('change', (e) => {
     showTrails = e.target.checked;
     if (!showTrails) resetTrails();
   });
+
+  $('random').addEventListener('click', () => loadSystem(randomSeed()));
+  $('load').addEventListener('click', () => loadSystem($('seed').value.trim() || randomSeed()));
+  $('seed').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') loadSystem($('seed').value.trim() || randomSeed());
+  });
+
+  $('copy').addEventListener('click', async () => {
+    const btn = $('copy');
+    try {
+      await navigator.clipboard.writeText(seed);
+    } catch (_) {
+      $('seed').select();
+      document.execCommand('copy'); // fallback for non-secure contexts
+    }
+    const old = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = old; }, 1100);
+  });
+
   $('pause').addEventListener('click', (e) => {
     paused = !paused;
     e.target.textContent = paused ? 'Play' : 'Pause';
   });
-  $('reset').addEventListener('click', () => {
-    t = 0; zoom = 1; panX = 0; panY = 0;
-    resetTrails();
-  });
+  $('fit').addEventListener('click', () => { panX = 0; panY = 0; fitView(); });
 }
